@@ -2380,8 +2380,7 @@ dependencies = [
 [[package]]
 name = "iroh-metrics"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "291065721ad7c477b972e581bbc528df031dc8eb5e39fe1ff3300ae5dfb157ef"
+source = "git+https://github.com/n0-computer/iroh-metrics?branch=Frando%2Ffix-unwind-safe#50fc3016c68d9eec2aabd1800448700e6772e0cb"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -2403,8 +2402,7 @@ dependencies = [
 [[package]]
 name = "iroh-metrics-derive"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ae5f0c4405d1fbc9fb16ff422ca40620e93dc36c30ecaba0c2aee3992b7bd48"
+source = "git+https://github.com/n0-computer/iroh-metrics?branch=Frando%2Ffix-unwind-safe#50fc3016c68d9eec2aabd1800448700e6772e0cb"
 dependencies = [
  "heck",
  "proc-macro2",
