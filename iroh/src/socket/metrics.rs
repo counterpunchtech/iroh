@@ -96,6 +96,27 @@ pub struct Metrics {
     /// Number of connections closed (only handshaked connections are counted).
     pub num_conns_closed: Counter,
 
+    /// Bolo soak: attempts to queue an address for a path-open retry
+    /// (`RemoteStateActor::queue_pending_open_path`), before dedup or the cap.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub pending_open_paths_enqueue_attempts: Counter,
+    /// Bolo soak: enqueue attempts dropped because the address was already queued.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub pending_open_paths_dedup_rejects: Counter,
+    /// Bolo soak: oldest entries evicted because the queue was at its cap.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub pending_open_paths_cap_evictions: Counter,
+    /// Bolo soak: the largest `pending_open_paths` length seen on any remote (a high-water
+    /// mark kept in a counter via `set`).
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub pending_open_paths_high_water: Counter,
+    /// Bolo soak: `open_path_ensure` failed with `RemoteCidsExhausted`.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub open_path_remote_cids_exhausted: Counter,
+    /// Bolo soak: `open_path_ensure` failed with `MaxPathIdReached`.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub open_path_max_path_id_reached: Counter,
+
     /// Number of IP transport paths opened.
     pub transport_ip_paths_added: Counter,
     /// Number of IP transport paths closed.

@@ -1124,9 +1124,13 @@ impl State {
                 match ret {
                     Some(Err(PathError::RemoteCidsExhausted)) => {
                         trace!(?open_4tuple, ?ret, "scheduling open_path");
+                        #[cfg(feature = "bolo-soak-metrics")]
+                        self.metrics.open_path_remote_cids_exhausted.inc();
                         OpenPathOutcome::Retry
                     }
                     Some(Err(PathError::MaxPathIdReached)) => {
+                        #[cfg(feature = "bolo-soak-metrics")]
+                        self.metrics.open_path_max_path_id_reached.inc();
                         // Path ids only ever increase, so this connection will never open
                         // another path.  Retrying it costs a queue slot every tick for as
                         // long as the connection lives.
@@ -1154,13 +1158,26 @@ impl State {
     /// bounded amount of memory however many connections and addresses it is reached on.
     fn queue_pending_open_path(&mut self, open_addr: &transports::FourTuple) {
         self.scheduled_open_path = Some(Instant::now() + OPEN_PATH_RETRY_DELAY);
+        #[cfg(feature = "bolo-soak-metrics")]
+        self.metrics.pending_open_paths_enqueue_attempts.inc();
         if self.pending_open_paths.contains(open_addr) {
+            #[cfg(feature = "bolo-soak-metrics")]
+            self.metrics.pending_open_paths_dedup_rejects.inc();
             return;
         }
         if self.pending_open_paths.len() >= MAX_PENDING_OPEN_PATHS {
             self.pending_open_paths.pop_front();
+            #[cfg(feature = "bolo-soak-metrics")]
+            self.metrics.pending_open_paths_cap_evictions.inc();
         }
         self.pending_open_paths.push_back(open_addr.clone());
+        #[cfg(feature = "bolo-soak-metrics")]
+        {
+            let len = self.pending_open_paths.len() as u64;
+            if len > self.metrics.pending_open_paths_high_water.get() {
+                self.metrics.pending_open_paths_high_water.set(len);
+            }
+        }
     }
 
     /// Returns the [`PathStatus`] for `addr`.
