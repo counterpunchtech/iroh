@@ -1789,6 +1789,29 @@ mod tests {
         assert!(state.scheduled_open_path.is_some());
     }
 
+    /// Bolo soak counters (counterpunchtech/bolo-harness#193): the same drive as above, read
+    /// through `socket::Metrics` — every attempt counted, duplicates rejected, the high-water
+    /// mark never past the cap. The gate's "patched must stay bounded" leg reads these.
+    #[test]
+    fn pending_open_paths_counters_report_the_bound() {
+        let (mut state, _guard) = test_state();
+        state.queue_pending_open_path(&addr(1));
+        for _ in 0..8 {
+            failing_retry_tick(&mut state, 4);
+        }
+        let m = state.metrics.clone();
+        assert_eq!(m.pending_open_paths_enqueue_attempts.get(), 1 + 8 * 4);
+        assert_eq!(m.pending_open_paths_dedup_rejects.get(), 8 * 3);
+        assert_eq!(m.pending_open_paths_cap_evictions.get(), 0);
+        assert_eq!(m.pending_open_paths_high_water.get(), 1);
+        // Fill past the cap with distinct addresses: evictions are counted, high-water = cap.
+        for port in 0..(MAX_PENDING_OPEN_PATHS as u16 + 10) {
+            state.queue_pending_open_path(&addr(port));
+        }
+        assert_eq!(m.pending_open_paths_cap_evictions.get(), 10 + 1);
+        assert_eq!(m.pending_open_paths_high_water.get(), MAX_PENDING_OPEN_PATHS as u64);
+    }
+
     /// The bound holds even when the addresses are all different.
     #[test]
     fn pending_open_paths_is_bounded_and_keeps_the_newest() {
