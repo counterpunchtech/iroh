@@ -1068,22 +1068,29 @@ impl State {
                                     self.metrics.open_path_max_path_id_reached.inc();
                                 }
                             }
-                            self.metrics.pending_open_paths_enqueue_attempts.inc();
                         }
-                        self.scheduled_open_path =
-                            Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_4tuple.clone());
-                        #[cfg(feature = "bolo-soak-metrics")]
-                        {
-                            let len = self.pending_open_paths.len() as u64;
-                            if len > self.metrics.pending_open_paths_high_water.get() {
-                                self.metrics.pending_open_paths_high_water.set(len);
-                            }
-                        }
+                        self.requeue_pending_open_path(open_4tuple);
                         trace!(?open_4tuple, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
                 }
+            }
+        }
+    }
+
+    /// Stock v1.2.0's requeue, unchanged in behaviour (schedule the 333 ms retry, push the
+    /// address back — no dedup, no cap), extracted so the instrumented-stock control can be
+    /// driven at the `State` level exactly like the patched branch's unit tests.
+    fn requeue_pending_open_path(&mut self, open_4tuple: &transports::FourTuple) {
+        #[cfg(feature = "bolo-soak-metrics")]
+        self.metrics.pending_open_paths_enqueue_attempts.inc();
+        self.scheduled_open_path = Some(Instant::now() + Duration::from_millis(333));
+        self.pending_open_paths.push_back(open_4tuple.clone());
+        #[cfg(feature = "bolo-soak-metrics")]
+        {
+            let len = self.pending_open_paths.len() as u64;
+            if len > self.metrics.pending_open_paths_high_water.get() {
+                self.metrics.pending_open_paths_high_water.set(len);
             }
         }
     }
@@ -1538,5 +1545,96 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
     match maybe_stream {
         None => None,
         Some(s) => Some(s.next().await),
+    }
+}
+
+#[cfg(test)]
+mod bolo_stock_tests {
+    //! Instrumented-stock control for counterpunchtech/bolo-harness#193: the *unfixed*
+    //! v1.2.0 requeue, driven at the `State` level exactly like n0-computer/iroh#4522's
+    //! own tests drive the fixed one. This test is expected to show the growth; it is the
+    //! "stock must grow" leg of Bolo's gate.
+    use std::net::SocketAddr;
+
+    use iroh_base::SecretKey;
+    use n0_watcher::Watchable;
+
+    use super::*;
+    use crate::socket::biased_rtt_path_selector::BiasedRttPathSelector;
+
+    fn test_state() -> (State, impl Sized) {
+        let metrics = Arc::new(SocketMetrics::default());
+        let watchable: Watchable<BTreeSet<DirectAddr>> = Watchable::new(BTreeSet::new());
+        let state = State {
+            endpoint_id: SecretKey::from_bytes(&[0u8; 32]).public(),
+            metrics: metrics.clone(),
+            local_direct_addrs: watchable.watch(),
+            mapped_addrs: MappedAddrs::default(),
+            address_lookup: AddressLookupServices::default(),
+            connections_close: Default::default(),
+            path_events: Default::default(),
+            addr_events: Default::default(),
+            paths: RemotePathState::new(metrics),
+            last_holepunch: None,
+            selected_path: None,
+            scheduled_holepunch: None,
+            scheduled_open_path: None,
+            pending_open_paths: VecDeque::new(),
+            address_lookup_stream: None,
+            path_selector: Arc::new(BiasedRttPathSelector::default()),
+        };
+        (state, watchable)
+    }
+
+    fn addr(port: u16) -> transports::FourTuple {
+        transports::FourTuple::Ip {
+            remote: SocketAddr::from(([127, 0, 0, 1], port)),
+            local: None,
+        }
+    }
+
+    /// One retry tick against a remote whose connections all refuse the path: the actor
+    /// drains the queue and tries every address on every connection, and each failure
+    /// requeues the address (stock v1.2.0 behaviour).
+    fn failing_retry_tick(state: &mut State, conns: usize) {
+        let addrs = std::mem::take(&mut state.pending_open_paths);
+        for open_addr in addrs {
+            for _ in 0..conns {
+                state.requeue_pending_open_path(&open_addr);
+            }
+        }
+    }
+
+    /// iroh#4390 / #4548: with K connections at the cap, one queued address becomes K per
+    /// tick — K^n growth. Four connections, four ticks: 1 → 4 → 16 → 64 → 256 entries, all
+    /// the same address. The counters the bolo-soak-metrics feature adds report it.
+    #[test]
+    fn pending_open_paths_grows_unbounded_across_retries_on_stock() {
+        let (mut state, _guard) = test_state();
+        state.requeue_pending_open_path(&addr(1));
+        let mut expected = 1usize;
+        for tick in 0..4 {
+            failing_retry_tick(&mut state, 4);
+            expected *= 4;
+            assert_eq!(
+                state.pending_open_paths.len(),
+                expected,
+                "stock queue should multiply by the connection count each tick (tick {})",
+                tick + 1
+            );
+        }
+        assert_eq!(state.pending_open_paths.len(), 256);
+        assert!(
+            state.pending_open_paths.iter().all(|a| *a == addr(1)),
+            "every entry is the same address — pure duplication"
+        );
+        assert_eq!(state.metrics.pending_open_paths_enqueue_attempts.get(), 1 + 4 + 16 + 64 + 256);
+        assert_eq!(state.metrics.pending_open_paths_dedup_rejects.get(), 0);
+        assert_eq!(state.metrics.pending_open_paths_cap_evictions.get(), 0);
+        assert!(
+            state.metrics.pending_open_paths_high_water.get() > 64,
+            "high-water {} must pass the bound the patch enforces",
+            state.metrics.pending_open_paths_high_water.get()
+        );
     }
 }
