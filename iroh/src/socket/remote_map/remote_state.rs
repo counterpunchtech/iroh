@@ -304,7 +304,7 @@ impl RemoteStateActor {
                 _ = &mut scheduled_path_open => {
                     trace!("triggering scheduled path_open");
                     self.state.scheduled_open_path = None;
-                    let mut addrs = std::mem::take(&mut self.state.pending_open_paths);
+                    let mut addrs = self.state.take_pending_open_paths();
                     while let Some(addr) = addrs.pop_front() {
                         self.open_path_on_all_conns(&addr);
                     }
@@ -788,6 +788,17 @@ impl RemoteStateActor {
     }
 }
 
+/// Bolo soak (`bolo-soak-metrics`): a remote's state going away takes its queue with it; keep
+/// the socket-wide `pending_open_paths_len` gauge honest.
+#[cfg(feature = "bolo-soak-metrics")]
+impl Drop for State {
+    fn drop(&mut self) {
+        self.metrics
+            .pending_open_paths_len
+            .dec_by(self.pending_open_paths.len() as i64);
+    }
+}
+
 impl State {
     /// Handles [`RemoteStateMessage::SendDatagram`].
     fn handle_msg_send_datagram(
@@ -1078,15 +1089,47 @@ impl State {
                 match ret {
                     Some(Err(PathError::RemoteCidsExhausted))
                     | Some(Err(PathError::MaxPathIdReached)) => {
+                        #[cfg(feature = "bolo-soak-metrics")]
+                        {
+                            match ret {
+                                Some(Err(PathError::RemoteCidsExhausted)) => {
+                                    self.metrics.open_path_remote_cids_exhausted.inc();
+                                }
+                                _ => {
+                                    self.metrics.open_path_max_path_id_reached.inc();
+                                }
+                            }
+                            self.metrics.pending_open_paths_enqueue_attempts.inc();
+                        }
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
                         self.pending_open_paths.push_back(open_4tuple.clone());
+                        #[cfg(feature = "bolo-soak-metrics")]
+                        {
+                            self.metrics.pending_open_paths_len.inc();
+                            let len = self.pending_open_paths.len() as u64;
+                            if len > self.metrics.pending_open_paths_high_water.get() {
+                                self.metrics.pending_open_paths_high_water.set(len);
+                            }
+                        }
                         trace!(?open_4tuple, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
                 }
             }
         }
+    }
+
+    /// Takes the retry queue for the scheduled `open_path` tick (the actor drains it and
+    /// re-tries every address on every connection). Extracted so the Bolo soak gauge is
+    /// decremented on the one path that empties the queue; no behaviour change.
+    fn take_pending_open_paths(&mut self) -> VecDeque<transports::FourTuple> {
+        let addrs = std::mem::take(&mut self.pending_open_paths);
+        #[cfg(feature = "bolo-soak-metrics")]
+        self.metrics
+            .pending_open_paths_len
+            .dec_by(addrs.len() as i64);
+        addrs
     }
 
     /// Returns the [`PathStatus`] for `addr`.

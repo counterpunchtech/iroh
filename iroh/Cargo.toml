@@ -164,6 +164,9 @@ tls-aws-lc-rs = ["noq/aws-lc-rs", "iroh-relay/tls-aws-lc-rs", "iroh-dns/tls-aws-
 unstable-custom-transports = []
 # Unstable: API to access an endpoint's NetReport (may change without notice)
 unstable-net-report = []
+# Bolo-only (counterpunchtech/iroh, instrumented-stock control for the soak harness):
+# counters on `socket::Metrics`. Off by default; zero cost when off.
+bolo-soak-metrics = []
 
 [package.metadata.docs.rs]
 all-features = true

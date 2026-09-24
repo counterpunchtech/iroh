@@ -1,4 +1,6 @@
 use iroh_metrics::{Counter, MetricsGroup};
+#[cfg(feature = "bolo-soak-metrics")]
+use iroh_metrics::Gauge;
 use serde::{Deserialize, Serialize};
 
 /// Metrics collected by the iroh socket.
@@ -95,6 +97,31 @@ pub struct Metrics {
     pub num_conns_opened: Counter,
     /// Number of connections closed (only handshaked connections are counted).
     pub num_conns_closed: Counter,
+
+    /// Bolo soak: pushes onto `pending_open_paths` (stock has no dedup and no cap, so
+    /// every retry counts here and `dedup_rejects` / `cap_evictions` stay 0).
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub pending_open_paths_enqueue_attempts: Counter,
+    /// Bolo soak: always 0 on stock (no dedup); present so both builds share a schema.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub pending_open_paths_dedup_rejects: Counter,
+    /// Bolo soak: always 0 on stock (no cap); present so both builds share a schema.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub pending_open_paths_cap_evictions: Counter,
+    /// Bolo soak: the largest `pending_open_paths` length seen on any remote.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub pending_open_paths_high_water: Counter,
+    /// Bolo soak: the current `pending_open_paths` length summed over the socket's remotes
+    /// (+1 on push, −n when the retry tick drains n, −len when a remote's state is dropped).
+    /// A gauge, so the soak report can see the queue drain — the high-water mark cannot.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub pending_open_paths_len: Gauge,
+    /// Bolo soak: `open_path_ensure` failed with `RemoteCidsExhausted`.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub open_path_remote_cids_exhausted: Counter,
+    /// Bolo soak: `open_path_ensure` failed with `MaxPathIdReached`.
+    #[cfg(feature = "bolo-soak-metrics")]
+    pub open_path_max_path_id_reached: Counter,
 
     /// Number of IP transport paths opened.
     pub transport_ip_paths_added: Counter,
