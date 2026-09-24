@@ -1804,11 +1804,14 @@ mod tests {
         assert_eq!(m.pending_open_paths_dedup_rejects.get(), 8 * 3);
         assert_eq!(m.pending_open_paths_cap_evictions.get(), 0);
         assert_eq!(m.pending_open_paths_high_water.get(), 1);
-        // Fill past the cap with distinct addresses: evictions are counted, high-water = cap.
+        // Fill past the cap with distinct addresses (addr(1) is already queued, so it is a
+        // dedup reject, not a new entry): 1 + 73 = 74 entries offered, 10 evicted, high-water
+        // = cap.
         for port in 0..(MAX_PENDING_OPEN_PATHS as u16 + 10) {
             state.queue_pending_open_path(&addr(port));
         }
-        assert_eq!(m.pending_open_paths_cap_evictions.get(), 10 + 1);
+        assert_eq!(m.pending_open_paths_dedup_rejects.get(), 8 * 3 + 1);
+        assert_eq!(m.pending_open_paths_cap_evictions.get(), 10);
         assert_eq!(m.pending_open_paths_high_water.get(), MAX_PENDING_OPEN_PATHS as u64);
     }
 
