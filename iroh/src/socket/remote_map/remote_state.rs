@@ -1099,19 +1099,8 @@ impl State {
                                     self.metrics.open_path_max_path_id_reached.inc();
                                 }
                             }
-                            self.metrics.pending_open_paths_enqueue_attempts.inc();
                         }
-                        self.scheduled_open_path =
-                            Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_4tuple.clone());
-                        #[cfg(feature = "bolo-soak-metrics")]
-                        {
-                            self.metrics.pending_open_paths_len.inc();
-                            let len = self.pending_open_paths.len() as u64;
-                            if len > self.metrics.pending_open_paths_high_water.get() {
-                                self.metrics.pending_open_paths_high_water.set(len);
-                            }
-                        }
+                        self.requeue_pending_open_path(open_4tuple);
                         trace!(?open_4tuple, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1130,6 +1119,25 @@ impl State {
             .pending_open_paths_len
             .dec_by(addrs.len() as i64);
         addrs
+    }
+
+    /// Stock v1.2.0's requeue, unchanged in v1.3.0 and unchanged in behaviour here (schedule
+    /// the 333 ms retry, push the address back — no dedup, no cap), extracted so the
+    /// instrumented-stock control can be driven at the `State` level exactly like the patched
+    /// branch's unit tests.
+    fn requeue_pending_open_path(&mut self, open_4tuple: &transports::FourTuple) {
+        #[cfg(feature = "bolo-soak-metrics")]
+        self.metrics.pending_open_paths_enqueue_attempts.inc();
+        self.scheduled_open_path = Some(Instant::now() + Duration::from_millis(333));
+        self.pending_open_paths.push_back(open_4tuple.clone());
+        #[cfg(feature = "bolo-soak-metrics")]
+        {
+            self.metrics.pending_open_paths_len.inc();
+            let len = self.pending_open_paths.len() as u64;
+            if len > self.metrics.pending_open_paths_high_water.get() {
+                self.metrics.pending_open_paths_high_water.set(len);
+            }
+        }
     }
 
     /// Returns the [`PathStatus`] for `addr`.
@@ -1653,5 +1661,127 @@ mod tests {
                 assert_eq!(&buf[..len], b"initial");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bolo_stock_tests {
+    //! Instrumented-stock control for counterpunchtech/bolo-harness#193: the *unfixed*
+    //! v1.3.0 requeue (unchanged since v1.2.0), driven at the `State` level exactly like
+    //! the patched branch's tests drive upstream's #4551 fix. This test is expected to show
+    //! the growth; it is the "stock must grow" leg of Bolo's gate.
+    use std::net::SocketAddr;
+
+    use iroh_base::SecretKey;
+    use n0_watcher::Watchable;
+
+    use super::*;
+    use crate::socket::biased_rtt_path_selector::BiasedRttPathSelector;
+
+    fn test_state() -> (State, impl Sized) {
+        test_state_with(Arc::new(SocketMetrics::default()))
+    }
+
+    /// Several remotes of one socket share one `SocketMetrics`.
+    fn test_state_with(metrics: Arc<SocketMetrics>) -> (State, impl Sized) {
+        let watchable: Watchable<BTreeSet<DirectAddr>> = Watchable::new(BTreeSet::new());
+        let state = State {
+            endpoint_id: SecretKey::from_bytes(&[0u8; 32]).public(),
+            metrics: metrics.clone(),
+            local_direct_addrs: watchable.watch(),
+            mapped_addrs: MappedAddrs::default(),
+            address_lookup: AddressLookupServices::default(),
+            connections_close: Default::default(),
+            path_events: Default::default(),
+            addr_events: Default::default(),
+            paths: RemotePathState::new(metrics),
+            last_holepunch: None,
+            selected_path: None,
+            scheduled_holepunch: None,
+            scheduled_open_path: None,
+            pending_open_paths: VecDeque::new(),
+            address_lookup_stream: None,
+            path_selector: Arc::new(BiasedRttPathSelector::default()),
+        };
+        (state, watchable)
+    }
+
+    fn addr(port: u16) -> transports::FourTuple {
+        transports::FourTuple::Ip {
+            remote: SocketAddr::from(([127, 0, 0, 1], port)),
+            local: None,
+        }
+    }
+
+    /// One retry tick against a remote whose connections all refuse the path: the actor
+    /// drains the queue and tries every address on every connection, and each failure
+    /// requeues the address (stock v1.2.0 behaviour).
+    fn failing_retry_tick(state: &mut State, conns: usize) {
+        let addrs = state.take_pending_open_paths();
+        for open_addr in addrs {
+            for _ in 0..conns {
+                state.requeue_pending_open_path(&open_addr);
+            }
+        }
+    }
+
+    /// iroh#4390 / #4548: with K connections at the cap, one queued address becomes K per
+    /// tick — K^n growth. Four connections, four ticks: 1 → 4 → 16 → 64 → 256 entries, all
+    /// the same address. The counters the bolo-soak-metrics feature adds report it.
+    #[test]
+    fn pending_open_paths_grows_unbounded_across_retries_on_stock() {
+        let (mut state, _guard) = test_state();
+        state.requeue_pending_open_path(&addr(1));
+        let mut expected = 1usize;
+        for tick in 0..4 {
+            failing_retry_tick(&mut state, 4);
+            expected *= 4;
+            assert_eq!(
+                state.pending_open_paths.len(),
+                expected,
+                "stock queue should multiply by the connection count each tick (tick {})",
+                tick + 1
+            );
+        }
+        assert_eq!(state.pending_open_paths.len(), 256);
+        assert!(
+            state.pending_open_paths.iter().all(|a| *a == addr(1)),
+            "every entry is the same address — pure duplication"
+        );
+        assert_eq!(state.metrics.pending_open_paths_enqueue_attempts.get(), 1 + 4 + 16 + 64 + 256);
+        assert_eq!(state.metrics.pending_open_paths_dedup_rejects.get(), 0);
+        assert_eq!(state.metrics.pending_open_paths_cap_evictions.get(), 0);
+        assert!(
+            state.metrics.pending_open_paths_high_water.get() > 64,
+            "high-water {} must pass the bound the patch enforces",
+            state.metrics.pending_open_paths_high_water.get()
+        );
+        assert_eq!(
+            state.metrics.pending_open_paths_len.get(),
+            256,
+            "the len gauge is the live queue length"
+        );
+    }
+
+    /// counterpunchtech/bolo-harness#208: the `pending_open_paths_len` gauge is the live
+    /// queue length summed over remotes — up on push, down when the retry tick drains,
+    /// down when a remote's state is dropped. The soak report's trend condition reads it.
+    #[test]
+    fn pending_open_paths_len_gauge_tracks_the_queue_and_drains() {
+        let metrics = Arc::new(SocketMetrics::default());
+        let (mut a, _ga) = test_state_with(metrics.clone());
+        let (mut b, _gb) = test_state_with(metrics.clone());
+        for port in 1..=3 {
+            a.requeue_pending_open_path(&addr(port));
+        }
+        b.requeue_pending_open_path(&addr(9));
+        b.requeue_pending_open_path(&addr(9));
+        assert_eq!(metrics.pending_open_paths_len.get(), 5, "3 on a + 2 on b (stock: no dedup)");
+        let drained = a.take_pending_open_paths();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(metrics.pending_open_paths_len.get(), 2, "a drained, b still queued");
+        drop(b);
+        assert_eq!(metrics.pending_open_paths_len.get(), 0, "b dropped with its queue");
+        assert_eq!(metrics.pending_open_paths_high_water.get(), 3);
     }
 }
