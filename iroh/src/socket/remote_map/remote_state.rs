@@ -1058,9 +1058,28 @@ impl State {
                 match ret {
                     Some(Err(PathError::RemoteCidsExhausted))
                     | Some(Err(PathError::MaxPathIdReached)) => {
+                        #[cfg(feature = "bolo-soak-metrics")]
+                        {
+                            match ret {
+                                Some(Err(PathError::RemoteCidsExhausted)) => {
+                                    self.metrics.open_path_remote_cids_exhausted.inc();
+                                }
+                                _ => {
+                                    self.metrics.open_path_max_path_id_reached.inc();
+                                }
+                            }
+                            self.metrics.pending_open_paths_enqueue_attempts.inc();
+                        }
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
                         self.pending_open_paths.push_back(open_4tuple.clone());
+                        #[cfg(feature = "bolo-soak-metrics")]
+                        {
+                            let len = self.pending_open_paths.len() as u64;
+                            if len > self.metrics.pending_open_paths_high_water.get() {
+                                self.metrics.pending_open_paths_high_water.set(len);
+                            }
+                        }
                         trace!(?open_4tuple, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
