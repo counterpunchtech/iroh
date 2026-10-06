@@ -1121,14 +1121,21 @@ impl State {
         addrs
     }
 
-    /// Stock v1.2.0's requeue, unchanged in v1.3.0 and unchanged in behaviour here (schedule
-    /// the 333 ms retry, push the address back — no dedup, no cap), extracted so the
-    /// instrumented-stock control can be driven at the `State` level exactly like the patched
-    /// branch's unit tests.
+    /// Upstream's #4551 requeue (`43e232f`): schedule the 333 ms retry and push the address
+    /// back unless it is already queued. Extracted (on bolo/1.3.0-metrics) so the `State`-level
+    /// tests can drive it; behaviour is upstream's.
     fn requeue_pending_open_path(&mut self, open_4tuple: &transports::FourTuple) {
         #[cfg(feature = "bolo-soak-metrics")]
         self.metrics.pending_open_paths_enqueue_attempts.inc();
         self.scheduled_open_path = Some(Instant::now() + Duration::from_millis(333));
+        // The number of distinct candidate 4-tuples for a remote is
+        // small (single digits), so `contains` is a short linear scan
+        // and bounds the queue to that set.
+        if self.pending_open_paths.contains(open_4tuple) {
+            #[cfg(feature = "bolo-soak-metrics")]
+            self.metrics.pending_open_paths_dedup_rejects.inc();
+            return;
+        }
         self.pending_open_paths.push_back(open_4tuple.clone());
         #[cfg(feature = "bolo-soak-metrics")]
         {
