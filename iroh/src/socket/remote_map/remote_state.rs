@@ -1672,11 +1672,12 @@ mod tests {
 }
 
 #[cfg(test)]
-mod bolo_stock_tests {
-    //! Instrumented-stock control for counterpunchtech/bolo-harness#193: the *unfixed*
-    //! v1.3.0 requeue (unchanged since v1.2.0), driven at the `State` level exactly like
-    //! the patched branch's tests drive upstream's #4551 fix. This test is expected to show
-    //! the growth; it is the "stock must grow" leg of Bolo's gate.
+mod bolo_patch_tests {
+    //! counterpunchtech/bolo-harness#193 / #208: upstream's #4551 fix (dedup only, no cap)
+    //! driven at the `State` level, read through the `bolo-soak-metrics` counters. This is the
+    //! "patched must stay BOUNDED" leg of Bolo's gate: one address never multiplies across retry
+    //! ticks, each address is held once, and the queue is bounded by the remote's distinct
+    //! candidate 4-tuples — not by a cap.
     use std::net::SocketAddr;
 
     use iroh_base::SecretKey;
@@ -1685,6 +1686,10 @@ mod bolo_stock_tests {
     use super::*;
     use crate::socket::biased_rtt_path_selector::BiasedRttPathSelector;
 
+    /// A [`State`] with no connections, which is all the pending-open-path queue needs.
+    ///
+    /// The returned guard keeps the direct-address watchable alive: the watcher in the state
+    /// disconnects when it drops.
     fn test_state() -> (State, impl Sized) {
         test_state_with(Arc::new(SocketMetrics::default()))
     }
@@ -1720,9 +1725,9 @@ mod bolo_stock_tests {
         }
     }
 
-    /// One retry tick against a remote whose connections all refuse the path: the actor
-    /// drains the queue and tries every address on every connection, and each failure
-    /// requeues the address (stock v1.2.0 behaviour).
+    /// One retry tick against a remote that has no connection ids left: the actor drains the
+    /// queue and tries every address it held on every connection, each of which fails and
+    /// requeues the address.
     fn failing_retry_tick(state: &mut State, conns: usize) {
         let addrs = state.take_pending_open_paths();
         for open_addr in addrs {
@@ -1732,47 +1737,83 @@ mod bolo_stock_tests {
         }
     }
 
-    /// iroh#4390 / #4548: with K connections at the cap, one queued address becomes K per
-    /// tick — K^n growth. Four connections, four ticks: 1 → 4 → 16 → 64 → 256 entries, all
-    /// the same address. The counters the bolo-soak-metrics feature adds report it.
+    /// iroh#4390: with several connections to one remote, a failing address must not multiply.
+    /// Stock: 1 → 4 → 16 → … ; #4551: the queue holds the address once, tick after tick.
     #[test]
-    fn pending_open_paths_grows_unbounded_across_retries_on_stock() {
+    fn pending_open_paths_stays_bounded_across_retries() {
         let (mut state, _guard) = test_state();
         state.requeue_pending_open_path(&addr(1));
-        let mut expected = 1usize;
-        for tick in 0..4 {
+        for tick in 0..8 {
             failing_retry_tick(&mut state, 4);
-            expected *= 4;
             assert_eq!(
                 state.pending_open_paths.len(),
-                expected,
-                "stock queue should multiply by the connection count each tick (tick {})",
+                1,
+                "queue should hold the one address after {} ticks",
                 tick + 1
             );
         }
-        assert_eq!(state.pending_open_paths.len(), 256);
-        assert!(
-            state.pending_open_paths.iter().all(|a| *a == addr(1)),
-            "every entry is the same address — pure duplication"
-        );
-        assert_eq!(state.metrics.pending_open_paths_enqueue_attempts.get(), 1 + 4 + 16 + 64 + 256);
-        assert_eq!(state.metrics.pending_open_paths_dedup_rejects.get(), 0);
+        assert!(state.scheduled_open_path.is_some());
+    }
+
+    /// Each distinct address is held once, in arrival order; re-offers are rejected.
+    #[test]
+    fn pending_open_paths_holds_each_address_once() {
+        let (mut state, _guard) = test_state();
+        for _ in 0..3 {
+            for port in 1..=6 {
+                state.requeue_pending_open_path(&addr(port));
+            }
+        }
+        assert_eq!(state.pending_open_paths.len(), 6);
+        assert_eq!(state.pending_open_paths.front(), Some(&addr(1)));
+        assert_eq!(state.pending_open_paths.back(), Some(&addr(6)));
+        assert_eq!(state.metrics.pending_open_paths_enqueue_attempts.get(), 18);
+        assert_eq!(state.metrics.pending_open_paths_dedup_rejects.get(), 12);
+        assert_eq!(state.metrics.pending_open_paths_high_water.get(), 6);
+    }
+
+    /// Bolo soak counters (counterpunchtech/bolo-harness#193): the retry drive above, read
+    /// through `socket::Metrics` — every attempt counted, duplicates rejected, no cap ever
+    /// acts, the high-water mark stays at the one address. The gate's "patched must stay
+    /// bounded" leg reads these.
+    #[test]
+    fn pending_open_paths_counters_report_the_bound() {
+        let (mut state, _guard) = test_state();
+        state.requeue_pending_open_path(&addr(1));
+        for _ in 0..8 {
+            failing_retry_tick(&mut state, 4);
+        }
+        let m = state.metrics.clone();
+        assert_eq!(m.pending_open_paths_enqueue_attempts.get(), 1 + 8 * 4);
+        assert_eq!(m.pending_open_paths_dedup_rejects.get(), 8 * 3);
+        assert_eq!(m.pending_open_paths_cap_evictions.get(), 0, "no cap in the #4551 shape");
+        assert_eq!(m.pending_open_paths_high_water.get(), 1);
+        assert_eq!(m.pending_open_paths_len.get(), 1);
+        let drained = state.take_pending_open_paths();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(m.pending_open_paths_len.get(), 0, "the gauge follows the drain");
+        assert_eq!(m.pending_open_paths_high_water.get(), 1, "the high-water mark does not");
+    }
+
+    /// The #4551 shape, stated: the bound is the remote's distinct candidate 4-tuples, not a
+    /// number. 74 distinct addresses queue 74 entries and nothing is evicted. In the field a
+    /// remote has single-digit candidates; the soak's `pending_high_water` verdict line
+    /// (≤ 64, counterpunchtech/bolo-harness#208) is what watches one that does not.
+    #[test]
+    fn pending_open_paths_is_deduplicated_not_capped() {
+        let (mut state, _guard) = test_state();
+        for port in 0..74u16 {
+            state.requeue_pending_open_path(&addr(port));
+        }
+        assert_eq!(state.pending_open_paths.len(), 74);
+        assert_eq!(state.metrics.pending_open_paths_high_water.get(), 74);
         assert_eq!(state.metrics.pending_open_paths_cap_evictions.get(), 0);
-        assert!(
-            state.metrics.pending_open_paths_high_water.get() > 64,
-            "high-water {} must pass the bound the patch enforces",
-            state.metrics.pending_open_paths_high_water.get()
-        );
-        assert_eq!(
-            state.metrics.pending_open_paths_len.get(),
-            256,
-            "the len gauge is the live queue length"
-        );
+        assert_eq!(state.metrics.pending_open_paths_dedup_rejects.get(), 0);
     }
 
     /// counterpunchtech/bolo-harness#208: the `pending_open_paths_len` gauge is the live
-    /// queue length summed over remotes — up on push, down when the retry tick drains,
-    /// down when a remote's state is dropped. The soak report's trend condition reads it.
+    /// queue length summed over remotes — up on a real push (not on a dedup reject), down when
+    /// the retry tick drains, down when a remote's state is dropped.
     #[test]
     fn pending_open_paths_len_gauge_tracks_the_queue_and_drains() {
         let metrics = Arc::new(SocketMetrics::default());
@@ -1781,12 +1822,14 @@ mod bolo_stock_tests {
         for port in 1..=3 {
             a.requeue_pending_open_path(&addr(port));
         }
+        a.requeue_pending_open_path(&addr(1));
         b.requeue_pending_open_path(&addr(9));
         b.requeue_pending_open_path(&addr(9));
-        assert_eq!(metrics.pending_open_paths_len.get(), 5, "3 on a + 2 on b (stock: no dedup)");
+        assert_eq!(metrics.pending_open_paths_len.get(), 4, "3 on a + 1 on b; rejects do not count");
+        assert_eq!(metrics.pending_open_paths_dedup_rejects.get(), 2);
         let drained = a.take_pending_open_paths();
         assert_eq!(drained.len(), 3);
-        assert_eq!(metrics.pending_open_paths_len.get(), 2, "a drained, b still queued");
+        assert_eq!(metrics.pending_open_paths_len.get(), 1, "a drained, b still queued");
         drop(b);
         assert_eq!(metrics.pending_open_paths_len.get(), 0, "b dropped with its queue");
         assert_eq!(metrics.pending_open_paths_high_water.get(), 3);
